@@ -39,7 +39,10 @@ router = APIRouter(tags=["api"])
 logger = logging.getLogger("sugar-ai")
 
 # load ai agent and document paths
-agent = RAGAgent(model=settings.DEFAULT_MODEL)
+active_model = "google/flan-t5-small" if settings.DEV_MODE else settings.DEFAULT_MODEL
+
+# Initialize the agent with the correct model name
+agent = RAGAgent(model=active_model)
 agent.retriever = agent.setup_vectorstore(settings.DOC_PATHS)
 
 # user quotas tracking

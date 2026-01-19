@@ -24,6 +24,8 @@ from sqlalchemy.orm import Session
 import os
 
 from app import create_app
+from app.ai import RAGAgent
+from app.ai import RAGAgent
 from app.database import get_db
 from app.auth import sync_env_keys_to_db
 from app.config import settings
@@ -38,7 +40,19 @@ async def startup_event():
     """Initialize data on app startup"""
     db = next(get_db())
     sync_env_keys_to_db(db)
-    logger.info(f"Starting Sugar-AI with model: {settings.DEFAULT_MODEL}")
+    
+    # 1. Determine the model
+    if settings.DEV_MODE:
+        active_model = "google/flan-t5-small"
+        logger.info(f"🔧 DEV_MODE enabled: using {active_model}")
+    else:
+        active_model = settings.DEFAULT_MODEL
+        logger.info(f"🚀 Starting Sugar-AI with model: {active_model}")
+
+    # 2. Attach the agent to the app state so routes can access it
+    app.state.agent = RAGAgent(model=active_model)
+    app.state.agent.retriever = app.state.agent.setup_vectorstore(settings.DOC_PATHS)
+
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
