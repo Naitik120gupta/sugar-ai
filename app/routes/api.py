@@ -14,6 +14,8 @@ from typing import Dict, Optional, List
 from app.database import get_db, APIKey
 from app.ai import RAGAgent
 from app.config import settings
+from fastapi import Header
+from openai import OpenAI
 
 # Pydantic models for chat completions
 class ChatMessage(BaseModel):
@@ -38,12 +40,8 @@ router = APIRouter(tags=["api"])
 # setup logging
 logger = logging.getLogger("sugar-ai")
 
-# load ai agent and document paths
-active_model = "google/flan-t5-small" if settings.DEV_MODE else settings.DEFAULT_MODEL
-
-# Initialize the agent with the correct model name
-agent = RAGAgent(model=active_model)
-agent.retriever = agent.setup_vectorstore(settings.DOC_PATHS)
+# Initialize the agent
+agent = None
 
 # user quotas tracking
 user_quotas: Dict[str, Dict] = {}
@@ -125,30 +123,58 @@ async def ask_question(
 async def ask_llm(
     question: str, 
     user_info: dict = Depends(verify_api_key), 
-    request: Request = None
+    request: Request = None,
+    # --- NEW BYOM HEADERS ---
+    custom_base_url: Optional[str] = Header(None, alias="X-Custom-Base-URL", description="E.g., http://localhost:11434/v1 for Ollama"),
+    custom_api_key: Optional[str] = Header(None, alias="X-Custom-API-Key"),
+    custom_model: Optional[str] = Header(None, alias="X-Custom-Model")
 ):
-    """Process a question with direct LLM call (no retrieval)"""
+    """Process a question. Supports Bring-Your-Own-Model (BYOM) via custom headers."""
     start_time = time.time()
-    
     client_ip = request.client.host if request else "unknown"
+    
     logger.info(f"REQUEST - /ask-llm - User: {user_info['name']} - IP: {client_ip} - Question: {question[:50]}...")
     
+    # Check quota
+    api_key = next(key for key, value in settings.API_KEYS.items() if value['name'] == user_info['name'])
+    remaining = settings.MAX_DAILY_REQUESTS - user_quotas.get(api_key, {}).get("count", 0)
+    
     try:
-        response = agent.model(question)
-        answer = response[0]['generated_text'].split("Answer:")[-1].strip()
+        answer = ""
+        
+        # --- BYOM ROUTING LOGIC ---
+        if custom_base_url and custom_api_key:
+            logger.info(f"BYOM Active: Routing request to custom endpoint: {custom_base_url}")
+            # Initialize the OpenAI-compatible client
+            client = OpenAI(api_key=custom_api_key, base_url=custom_base_url)
+            model_to_use = custom_model or "gpt-3.5-turbo" # Default fallback
+            
+            # Make the external call
+            completion = client.chat.completions.create(
+                model=model_to_use,
+                messages=[{"role": "user", "content": question}],
+                max_tokens=1024
+            )
+            answer = completion.choices[0].message.content
+            
+        else:
+            # --- DEFAULT SUGAR-AI FALLBACK ---
+            logger.info("Using default Sugar-AI Agent")
+            response = agent.model(question)
+            # Adjust this parsing based on how your specific local model returns text
+            answer = response[0]['generated_text'].split("Answer:")[-1].strip() 
+        # --------------------------
         
         process_time = time.time() - start_time
         logger.info(f"RESPONSE - User: {user_info['name']} - Success - Time: {process_time:.2f}s")
         
-        # check quota
-        api_key = next(key for key, value in settings.API_KEYS.items() if value['name'] == user_info['name'])
-        remaining = settings.MAX_DAILY_REQUESTS - user_quotas.get(api_key, {}).get("count", 0)
-        
         return {
             "answer": answer, 
             "user": user_info["name"],
-            "quota": {"remaining": remaining, "total": settings.MAX_DAILY_REQUESTS}
+            "quota": {"remaining": remaining, "total": settings.MAX_DAILY_REQUESTS},
+            "provider": "custom" if custom_base_url else "sugar-ai-default" # Let the user know which engine answered
         }
+        
     except Exception as e:
         logger.error(f"ERROR - User: {user_info['name']} - Error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error processing request: {str(e)}")
